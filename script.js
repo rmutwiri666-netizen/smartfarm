@@ -47,6 +47,7 @@ const plans = [
 ];
 
 let products = sampleProducts;
+let localProducts = [];
 let orders = sampleOrders;
 let subscriptionRequests = [];
 let transactions = sampleTransactions;
@@ -54,6 +55,9 @@ let billingFrequency = 'monthly';
 let toastTimer;
 let previewImage = '';
 let openedProductId = '';
+let currentUser = null;
+let sharedApiAvailable = false;
+let authMode = 'login';
 
 function readStored(key, fallback) {
   try {
@@ -108,6 +112,102 @@ function showToast(message) {
   toastTimer = setTimeout(() => toast.classList.remove('visible'), 3000);
 }
 
+async function requestApi(route, options = {}) {
+  const response = await fetch(route, {
+    credentials: 'same-origin',
+    ...options,
+    headers: { 'content-type': 'application/json', ...options.headers }
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(result.error || 'The request could not be completed.');
+  return result;
+}
+
+function updateAccountUI() {
+  const name = currentUser?.name || 'Guest visitor';
+  document.querySelector('#account-name').textContent = name;
+  document.querySelector('#account-email').textContent = currentUser?.email || 'Sign in to sell';
+  document.querySelector('#account-avatar').textContent = currentUser
+    ? name.split(/\s+/).slice(0, 2).map((part) => part[0]).join('').toUpperCase()
+    : 'SF';
+  const accountButton = document.querySelector('#account-button');
+  accountButton.textContent = currentUser ? 'Account' : 'Sign in';
+  accountButton.setAttribute('aria-label', currentUser ? `Account for ${name}` : 'Sign in or create a seller account');
+  const sellerInput = document.querySelector('#advert-form [name="seller"]');
+  sellerInput.value = currentUser?.name || '';
+  sellerInput.readOnly = Boolean(currentUser);
+  document.querySelector('#advert-form .form-foot p').textContent = currentUser
+    ? 'Your listing will be shared with visitors of this SmartFarm marketplace.'
+    : 'Sign in or create an account to publish this listing to the shared marketplace.';
+  updateListingPreview();
+}
+
+function renderAccountDialog() {
+  const signedIn = Boolean(currentUser);
+  const registering = authMode === 'register';
+  const nameField = document.querySelector('#auth-name-field');
+  const nameInput = nameField.querySelector('input');
+  document.querySelector('#account-dialog-title').textContent = signedIn ? 'Seller account' : registering ? 'Create seller account' : 'Sign in';
+  document.querySelector('#auth-description').textContent = signedIn
+    ? 'Your account publishes products to the shared SmartFarm marketplace.'
+    : registering ? 'Create your account to publish products and manage your farm.' : 'Sign in to manage your farm and publish products to the shared marketplace.';
+  document.querySelector('#auth-form').hidden = signedIn;
+  document.querySelector('#auth-toggle').hidden = signedIn;
+  document.querySelector('#account-signed-in').hidden = !signedIn;
+  document.querySelector('#signed-in-email').textContent = currentUser?.email || '';
+  nameField.hidden = !registering;
+  nameInput.required = registering;
+  document.querySelector('#auth-form [name="password"]').autocomplete = registering ? 'new-password' : 'current-password';
+  document.querySelector('#auth-submit').textContent = registering ? 'Create account' : 'Sign in';
+  document.querySelector('#auth-toggle').textContent = registering ? 'Already have an account? Sign in' : 'New to SmartFarm? Create an account';
+}
+
+function openAccountDialog(mode = 'login') {
+  authMode = mode;
+  renderAccountDialog();
+  const dialog = document.querySelector('#account-dialog');
+  if (!dialog.open) dialog.showModal();
+}
+
+async function importLegacyListings() {
+  if (!currentUser) return;
+  const marker = `smartfarm-listing-import-${currentUser.id}`;
+  try {
+    if (localStorage.getItem(marker)) return;
+  } catch {
+    return;
+  }
+  const oldListings = localProducts.filter((product) => product.id?.startsWith('seller-')
+    && product.seller?.trim().toLowerCase() === currentUser.name.trim().toLowerCase());
+  if (!oldListings.length) return;
+  for (const product of oldListings) {
+    await requestApi('/api/products', {
+      method: 'POST',
+      body: JSON.stringify({
+        name: product.name,
+        category: product.category,
+        location: product.location,
+        price: product.price,
+        unit: product.unit,
+        quantity: product.quantity,
+        description: product.description,
+        image: product.image
+      })
+    });
+  }
+  try {
+    localStorage.setItem(marker, '1');
+  } catch {
+    showToast('Your existing listings were shared, but this browser could not save the import marker.');
+  }
+}
+
+async function loadSharedProducts() {
+  const result = await requestApi('/api/products');
+  products = [...sampleProducts, ...result.products];
+  renderMarketplace();
+}
+
 function switchView(name, updateHash = true) {
   const target = document.querySelector(`[data-view="${name}"]`);
   if (!target) return;
@@ -140,19 +240,19 @@ function renderMarketplace() {
   document.querySelector('#results-count').textContent = `${filtered.length} ${filtered.length === 1 ? 'product' : 'products'}`;
   document.querySelector('#empty-state').hidden = filtered.length > 0;
   document.querySelector('#market-product-grid').hidden = filtered.length === 0;
-  const ownProducts = products.filter((product) => product.own).slice(0, 3);
+  const ownProducts = (currentUser ? products.filter((product) => product.ownerId === currentUser.id) : products.filter((product) => product.own)).slice(0, 3);
   document.querySelector('#overview-products').innerHTML = ownProducts.map((product) => `<article class="mini-product" data-product-id="${escapeHTML(product.id)}" tabindex="0"><div class="mini-product-photo" style="background-image:url('${escapeHTML(product.image)}')"></div><h3 class="mini-product-title">${escapeHTML(product.name)}</h3><div class="mini-product-meta"><strong>${formatCurrency(product.price)}</strong><span>${escapeHTML(product.location)}</span></div></article>`).join('');
   renderInventory();
 }
 
 function renderInventory() {
-  const ownProducts = products.filter((product) => product.own);
+  const ownProducts = currentUser ? products.filter((product) => product.ownerId === currentUser.id) : [];
   document.querySelector('#active-product-count').textContent = ownProducts.length;
   document.querySelector('#farm-product-count').textContent = ownProducts.length;
-  document.querySelector('#inventory-body').innerHTML = ownProducts.map((product) => {
+  document.querySelector('#inventory-body').innerHTML = ownProducts.length ? ownProducts.map((product) => {
     const isLow = product.quantity <= 10;
     return `<tr><td><div class="inventory-product"><span class="inventory-thumb" style="background-image:url('${escapeHTML(product.image)}')"></span><span><strong>${escapeHTML(product.name)}</strong><small>${escapeHTML(product.seller)}</small></span></div></td><td>${escapeHTML(product.category)}</td><td class="${isLow ? 'stock-low' : ''}">${Number(product.quantity).toLocaleString('en-KE')} ${escapeHTML(product.unit.replace('per ', ''))}</td><td>${formatCurrency(product.price)} <span>/ ${escapeHTML(product.unit.replace('per ', ''))}</span></td><td><span class="stock-pill ${isLow ? 'low' : ''}">${isLow ? 'Low stock' : 'In stock'}</span></td></tr>`;
-  }).join('');
+  }).join('') : `<tr><td colspan="5">${currentUser ? 'No listings yet. Add a product to get started.' : 'Sign in to view and manage your farm listings.'}</td></tr>`;
 }
 
 function renderFinances() {
@@ -268,6 +368,15 @@ async function requestSubscription(planId) {
 }
 
 function bindEvents() {
+  document.querySelector('#account-button').addEventListener('click', () => openAccountDialog());
+  document.querySelector('#account-close').addEventListener('click', () => document.querySelector('#account-dialog').close());
+  document.querySelector('#auth-form').addEventListener('submit', submitAuth);
+  document.querySelector('#auth-toggle').addEventListener('click', () => {
+    authMode = authMode === 'register' ? 'login' : 'register';
+    renderAccountDialog();
+  });
+  document.querySelector('#sign-out-button').addEventListener('click', signOut);
+
   document.querySelectorAll('[data-view-link], [data-open-view]').forEach((element) => {
     element.addEventListener('click', (event) => {
       event.preventDefault();
@@ -328,6 +437,51 @@ function bindEvents() {
   window.addEventListener('hashchange', handleLocation);
 }
 
+async function submitAuth(event) {
+  event.preventDefault();
+  const form = new FormData(event.currentTarget);
+  const registering = authMode === 'register';
+  const body = {
+    email: form.get('email').trim(),
+    password: form.get('password')
+  };
+  if (registering) body.name = form.get('name').trim();
+  try {
+    const result = await requestApi(registering ? '/api/register' : '/api/login', {
+      method: 'POST',
+      body: JSON.stringify(body)
+    });
+    currentUser = result.user;
+    sharedApiAvailable = true;
+    updateAccountUI();
+    renderAccountDialog();
+    document.querySelector('#account-dialog').close();
+    try {
+      await importLegacyListings();
+      await loadSharedProducts();
+    } catch (error) {
+      showToast(error.message);
+    }
+    showToast(registering ? 'Account created. Your farm is ready to publish.' : 'You are signed in.');
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+async function signOut() {
+  try {
+    await requestApi('/api/logout', { method: 'POST' });
+    currentUser = null;
+    updateAccountUI();
+    renderAccountDialog();
+    document.querySelector('#account-dialog').close();
+    renderMarketplace();
+    showToast('You are signed out. Marketplace listings remain public.');
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
 async function addTransaction(event) {
   event.preventDefault();
   const form = event.currentTarget;
@@ -381,34 +535,43 @@ function updateListingPreview() {
 
 async function addProduct(event) {
   event.preventDefault();
+  if (!currentUser) {
+    showToast('Create an account or sign in to publish a listing.');
+    openAccountDialog('register');
+    return;
+  }
+  if (!sharedApiAvailable) {
+    showToast('The shared marketplace server is unavailable. Try again when it is online.');
+    return;
+  }
   const form = event.currentTarget;
   const data = new FormData(form);
   const product = {
-    id: `seller-${Date.now()}`,
     name: data.get('name').trim(),
     category: data.get('category'),
     location: data.get('location').trim(),
-    seller: data.get('seller').trim(),
     price: Number(data.get('price')),
     unit: data.get('unit'),
     quantity: Number(data.get('quantity')),
     description: data.get('description').trim() || 'Fresh farm listing. Contact SmartFarm to ask about availability.',
-    image: previewImage || photos.vegetables,
-    own: true
+    image: previewImage || photos.vegetables
   };
-  if (!Number.isFinite(product.price) || product.price <= 0 || !Number.isFinite(product.quantity) || product.quantity < 1) {
+  if (!Number.isFinite(product.price) || product.price <= 0 || !Number.isInteger(product.quantity) || product.quantity < 1) {
     showToast('Enter a valid price and available quantity.');
     return;
   }
-  products.unshift(product);
-  await saveStored(storageKeys.products, products);
-  renderMarketplace();
-  form.reset();
-  previewImage = '';
-  document.querySelector('.preview-photo').style.backgroundImage = '';
-  updateListingPreview();
-  switchView('marketplace');
-  showToast('Listing added to this browser’s marketplace preview.');
+  try {
+    await requestApi('/api/products', { method: 'POST', body: JSON.stringify(product) });
+    await loadSharedProducts();
+    form.reset();
+    previewImage = '';
+    document.querySelector('.preview-photo').style.backgroundImage = '';
+    updateAccountUI();
+    switchView('marketplace');
+    showToast('Your listing is live in the shared marketplace.');
+  } catch (error) {
+    showToast(error.message);
+  }
 }
 
 function setupPhotoUpload() {
@@ -438,20 +601,36 @@ function setupPhotoUpload() {
 
 async function init() {
   try {
-    [products, orders, subscriptionRequests, transactions] = await Promise.all([
+    [localProducts, orders, subscriptionRequests, transactions] = await Promise.all([
       readDatabase(storageKeys.products, sampleProducts),
       readDatabase(storageKeys.orders, sampleOrders),
       readDatabase(storageKeys.subscriptions, []),
       readDatabase(storageKeys.transactions, sampleTransactions)
     ]);
   } catch {
-    products = readStored(storageKeys.products, sampleProducts);
+    localProducts = readStored(storageKeys.products, sampleProducts);
     orders = readStored(storageKeys.orders, sampleOrders);
     subscriptionRequests = readStored(storageKeys.subscriptions, []);
     transactions = readStored(storageKeys.transactions, sampleTransactions);
     showToast('Using browser storage because IndexedDB could not be opened.');
   }
 
+  try {
+    const [session] = await Promise.all([requestApi('/api/session')]);
+    currentUser = session.user;
+    await loadSharedProducts();
+    sharedApiAvailable = true;
+    if (currentUser) {
+      await importLegacyListings();
+      await loadSharedProducts();
+    }
+  } catch {
+    currentUser = null;
+    products = sampleProducts;
+    showToast('Shared accounts need the SmartFarm server. Start it with npm start.');
+  }
+
+  updateAccountUI();
   renderMarketplace();
   renderOrders();
   renderPlans();
@@ -460,6 +639,7 @@ async function init() {
   bindEvents();
   setupPhotoUpload();
   handleLocation();
+  if (sharedApiAvailable) window.setInterval(() => loadSharedProducts().catch(() => {}), 15000);
 }
 
 init();
